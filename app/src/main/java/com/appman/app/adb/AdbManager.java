@@ -70,75 +70,151 @@ public final class AdbManager {
 
     public void disconnect() { try { shell = null; manager().disconnect(); } catch (Throwable ignored) {} }
 
+//    public String exec(String command) throws Exception {
+//        if (command == null || command.trim().isEmpty()) return "";
+//
+//        try {
+//            return execOnce(command);
+//        } catch (Throwable first) {
+//
+//            // The ADB transport may have gone stale while the app was
+//            // in the background. Reconnect the transport and try opening
+//            // the command stream again.
+//            if (!isTransportFailure(first)) {
+//                throw first;
+//            }
+//
+//            reconnect();
+//
+//            return execOnce(command);
+//        }
+//    }
+//
+//
+//
+//    private String execOnce(String command) throws Exception {
+//        AbsAdbConnectionManager m = manager();
+//
+//        AdbStream s = m.openStream("shell:" + command);
+//
+//        StringBuilder out = new StringBuilder();
+//
+//        try (InputStream in = s.openInputStream()) {
+//            byte[] buf = new byte[8192];
+//            int n;
+//
+//            while ((n = in.read(buf)) != -1) {
+//                out.append(new String(buf, 0, n, StandardCharsets.UTF_8));
+//            }
+//
+//            return out.toString();
+//
+//        } catch (IOException e) {
+//
+//            /*
+//             * The command may already have completed successfully even
+//             * though the underlying ADB transport closed while we were
+//             * reading its final output.
+//             *
+//             * Do NOT run the command a second time in this situation.
+//             * Commands such as uninstall/clear-data must never be
+//             * blindly duplicated.
+//             */
+//            if (isStreamClosed(e)) {
+//                try {
+//                    reconnect();
+//                } catch (Throwable ignored) {
+//                }
+//
+//                return out.toString();
+//            }
+//
+//            throw e;
+//
+//        } finally {
+//            try {
+//                s.close();
+//            } catch (Throwable ignored) {
+//            }
+//        }
+//    }
+
+    private static final java.util.concurrent.ScheduledExecutorService WATCHDOG =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "adb-watchdog");
+                t.setDaemon(true);
+                return t;
+            });
+
+    private final Object execLock = new Object();
+
     public String exec(String command) throws Exception {
+        return exec(command, 8000L);
+    }
+
+    public String exec(String command, long timeoutMs) throws Exception {
         if (command == null || command.trim().isEmpty()) return "";
 
-        try {
-            return execOnce(command);
-        } catch (Throwable first) {
-
-            // The ADB transport may have gone stale while the app was
-            // in the background. Reconnect the transport and try opening
-            // the command stream again.
-            if (!isTransportFailure(first)) {
-                throw first;
+        // One adb stream at a time. Bulk actions and the per-app detail
+        // toggles both call exec(); overlapping streams stall each other.
+        synchronized (execLock) {
+            try {
+                return execOnce(command, timeoutMs);
+            } catch (OpenStreamException e) {
+                // The stream never opened, so the command never ran on the
+                // device. This is the only case where retrying is safe.
+                reconnect();
+                return execOnce(command, timeoutMs);
             }
-
-            reconnect();
-
-            return execOnce(command);
         }
     }
 
+    private static final class OpenStreamException extends Exception {
+        OpenStreamException(Throwable cause) { super(cause); }
+    }
 
-
-    private String execOnce(String command) throws Exception {
+    private String execOnce(String command, long timeoutMs) throws Exception {
         AbsAdbConnectionManager m = manager();
 
-        AdbStream s = m.openStream("shell:" + command);
+        final AdbStream s;
+        try {
+            s = m.openStream("shell:" + command);
+        } catch (Throwable t) {
+            throw new OpenStreamException(t);
+        }
+
+        final java.util.concurrent.atomic.AtomicBoolean timedOut =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        // Closing the stream is the only way to break out of a blocking
+        // read. Coroutine cancellation and withTimeoutOrNull cannot.
+        java.util.concurrent.ScheduledFuture<?> watchdog = WATCHDOG.schedule(() -> {
+            timedOut.set(true);
+            try { s.close(); } catch (Throwable ignored) {}
+        }, timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
 
         StringBuilder out = new StringBuilder();
 
         try (InputStream in = s.openInputStream()) {
             byte[] buf = new byte[8192];
             int n;
-
             while ((n = in.read(buf)) != -1) {
                 out.append(new String(buf, 0, n, StandardCharsets.UTF_8));
             }
-
-            return out.toString();
-
         } catch (IOException e) {
-
-            /*
-             * The command may already have completed successfully even
-             * though the underlying ADB transport closed while we were
-             * reading its final output.
-             *
-             * Do NOT run the command a second time in this situation.
-             * Commands such as uninstall/clear-data must never be
-             * blindly duplicated.
-             */
-            if (isStreamClosed(e)) {
-                try {
-                    reconnect();
-                } catch (Throwable ignored) {
-                }
-
-                return out.toString();
-            }
-
-            throw e;
-
+            // A closed stream is how a finished shell command normally ends.
+            // It is not a transport fault and must not trigger a reconnect.
+            if (!timedOut.get() && !isStreamClosed(e)) throw e;
         } finally {
-            try {
-                s.close();
-            } catch (Throwable ignored) {
-            }
+            watchdog.cancel(false);
+            try { s.close(); } catch (Throwable ignored) {}
         }
-    }
 
+        if (timedOut.get()) {
+            out.append("\nERROR: timed out after ").append(timeoutMs).append("ms");
+        }
+        return out.toString();
+    }
     private boolean isTransportFailure(Throwable t) {
         Throwable current = t;
 

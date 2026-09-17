@@ -14,6 +14,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
@@ -34,6 +36,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.Font
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.foundation.text.KeyboardOptions
 //import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.KeyboardType
@@ -67,6 +71,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.input.pointer.PointerEventPass
 import kotlinx.coroutines.withTimeoutOrNull
+import androidx.compose.foundation.clickable
 
 private val Ink = Color(0xFF17202A)
 private val Teal = Color(0xFF218DAE)
@@ -78,6 +83,11 @@ private val Yellow = Color(0xFFFFD758)
 private val Sand = Color(0xFFE9DFC3)
 private val White = Color(0xFFFFF8F8)
 private val Black = Color(0xFF000000)
+
+// app/src/main/res/fonts/ndot77jp_extended.ttf — rename the .ttf to this
+// (Android font resource names must be lowercase letters/digits/underscores
+// only) before building.
+private val NdotFont = FontFamily(Font(R.font.ndot77jp_extended))
 
 data class AppItem(val label: String, val packageName: String, val icon: Drawable, val system: Boolean, val sizeBytes: Long)
 
@@ -128,6 +138,7 @@ class MainActivity : ComponentActivity() {
     val scope = rememberCoroutineScope()
     var terminal by remember { mutableStateOf(false) }
     var apps by remember { mutableStateOf<List<AppItem>>(emptyList()) }
+    var appsLoading by remember { mutableStateOf(true) }
     var filter by remember { mutableStateOf(AppFilter.INSTALLED) }
     var sort by remember { mutableStateOf(SortBy.NAME) }
     var ascending by remember { mutableStateOf(true) }
@@ -147,13 +158,15 @@ class MainActivity : ComponentActivity() {
     var netAll by remember { mutableStateOf(false) }
     var netBackground by remember { mutableStateOf(false) }
     var netMenuOpen by remember { mutableStateOf(false) }
+    var netSelected by remember { mutableStateOf(false) } // chip selection, independent of the toggles above
     var multiRunning by remember { mutableStateOf(false) }
     var multiJob by remember { mutableStateOf<Job?>(null) }
     var snack by remember { mutableStateOf<String?>(null) }
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
     LaunchedEffect(Unit) {
-        apps = loadApps(context)
+        apps = withContext(Dispatchers.IO) { loadApps(context) }
+        appsLoading = false
 
         if (
             Build.VERSION.SDK_INT >= 33 &&
@@ -165,15 +178,48 @@ class MainActivity : ComponentActivity() {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        // Check immediately when AppMan starts.
+        // Check immediately when AppMan starts. A fresh process has a
+        // brand new (unconnected) AdbManager even if the device was
+        // paired and connected in a previous session, so a plain
+        // isConnected() here will almost always come back false right
+        // after launch. Try a silent autoConnect() as a one-shot retry
+        // before giving up and asking the user to pair again — if the
+        // device still remembers this app's key, this reconnects
+        // without any code entry.
         connected = withContext(Dispatchers.IO) {
-            AdbManager.get(context).isConnected()
+            val adb = AdbManager.get(context)
+            if (adb.isConnected()) {
+                true
+            } else {
+                val reconnected = runCatching { adb.autoConnect() }.getOrDefault(false)
+                reconnected || adb.isConnected()
+            }
         }
     }
+    // Keep the connection indicator honest, and opportunistically retry
+    // a silent autoConnect() while disconnected — covers the case where
+    // wireless debugging only became reachable (network back, device
+    // unlocked, etc.) after AppMan had already given up.
     LaunchedEffect(Unit) {
+        var sinceLastAutoConnect = 0
         while (true) {
             val state = withContext(Dispatchers.IO) {
-                AdbManager.get(context).isConnected()
+                val adb = AdbManager.get(context)
+                if (adb.isConnected()) {
+                    true
+                } else {
+                    sinceLastAutoConnect++
+                    // Try roughly every 5 seconds while disconnected,
+                    // not every poll tick, so we don't hammer the
+                    // transport.
+                    if (sinceLastAutoConnect >= 5) {
+                        sinceLastAutoConnect = 0
+                        val reconnected = runCatching { adb.autoConnect() }.getOrDefault(false)
+                        reconnected || adb.isConnected()
+                    } else {
+                        false
+                    }
+                }
             }
 
             if (connected != state) {
@@ -181,6 +227,16 @@ class MainActivity : ComponentActivity() {
             }
 
             kotlinx.coroutines.delay(1000)
+        }
+    }
+    // Periodically refresh the installed-app list in the background so
+    // installs/uninstalls/size changes made outside AppMan (or via ADB
+    // commands run from the terminal) show up without a manual restart.
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(5000)
+            val refreshed = withContext(Dispatchers.IO) { loadApps(context) }
+            apps = refreshed
         }
     }
 
@@ -192,11 +248,12 @@ class MainActivity : ComponentActivity() {
     }
 
     fun log(line: String, kind: String = "cmd") { hood = (hood + HoodLine(kind, line)).takeLast(500) }
-    suspend fun execAwait(command: String): String {
+    suspend fun execAwait(command: String, timeoutMs: Long = 8000): String {
         log("$ $command", "cmd")
         val result = withContext(Dispatchers.IO) {
             try {
-                AdbManager.get(context).exec(command)
+                withTimeoutOrNull(timeoutMs + 3000) { AdbManager.get(context).exec(command, timeoutMs) }
+                    ?: "ERROR: timed out after ${timeoutMs}ms, skipping"
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
@@ -208,9 +265,9 @@ class MainActivity : ComponentActivity() {
         return result
     }
 
-    suspend fun execBulk(command: String): String {
+    suspend fun execBulk(command: String, timeoutMs: Long = 8000): String {
         currentCoroutineContext().ensureActive()
-        return execAwait(command)
+        return execAwait(command, timeoutMs)
     }
     fun runCommand(command: String) {
         scope.launch { execAwait(command) }
@@ -316,6 +373,18 @@ class MainActivity : ComponentActivity() {
                         Modifier
                             .fillMaxSize()
                     ) {
+
+                        if (appsLoading && apps.isEmpty()) {
+                            Column(
+                                Modifier
+                                    .align(Alignment.Center),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(14.dp)
+                            ) {
+                                PixelLoader()
+                                Text("Loading apps…", color = Ink.copy(alpha = 0.55f), fontSize = 13.sp)
+                            }
+                        }
 
                         LazyColumn(
                             state = listState,
@@ -472,13 +541,14 @@ class MainActivity : ComponentActivity() {
                                             multiActions + key
                                         }
                                 },
-                                netSelected = netAll || netBackground,
+                                netSelected = netSelected,
                                 netAll = netAll,
                                 netBackground = netBackground,
                                 toggleNetAll = { netAll = !netAll },
                                 toggleNetBackground = { netBackground = !netBackground },
                                 netMenuOpen = netMenuOpen,
-                                onNetClick = { netMenuOpen = !netMenuOpen },
+                                onNetClick = { netSelected = !netSelected },
+                                onNetExpandClick = { netMenuOpen = !netMenuOpen },
                                 onNetDismiss = { netMenuOpen = false },
                                 running = multiRunning,
                                 onGo = {
@@ -490,85 +560,97 @@ class MainActivity : ComponentActivity() {
                                     } else {
                                         val targets = selected.toList()
                                         val actions = multiActions
-                                        val doNetAll = netAll
-                                        val doNetBackground = netBackground
+                                        // Both switch positions are meaningful now (on = allow,
+                                        // off = restrict), so whether net work happens is driven
+                                        // by the chip being selected, not by the toggle values.
+                                        val doNet = netSelected
+                                        val allowAll = netAll
+                                        val allowBackground = netBackground
 
                                         val hasWork =
                                             targets.isNotEmpty() &&
-                                                    (actions.isNotEmpty() || doNetAll || doNetBackground)
+                                                    (actions.isNotEmpty() || doNet)
 
                                         if (hasWork) {
                                             multiJob = scope.launch {
                                                 multiRunning = true
+                                                // Pause between each app so one slow/stuck adb
+                                                // command doesn't run straight into the next
+                                                // without the connection settling.
+                                                val interAppDelayMs = 1500L
                                                 try {
-                                                    // 2. Data, for every selected app.
-                                                    if (actions.contains("data")) {
-                                                        targets.forEach { pkg ->
-                                                            execBulk("pm clear $pkg")
+                                                    // Net setup that only needs to happen once,
+                                                    // not per app: make sure chain3 enforcement
+                                                    // is on before any per-app networking calls.
+                                                    if (doNet) {
+                                                        val chain3 =
+                                                            execBulk("cmd connectivity get-chain3-enabled").trim()
+                                                        val chain3Disabled =
+                                                            chain3.equals("false", ignoreCase = true) ||
+                                                                    chain3.equals("disabled", ignoreCase = true) ||
+                                                                    chain3.endsWith(": false", ignoreCase = true) ||
+                                                                    chain3.endsWith(": disabled", ignoreCase = true)
+
+                                                        if (chain3Disabled) {
+                                                            execBulk("cmd connectivity set-chain3-enabled true")
                                                         }
                                                     }
 
-                                                    // 3. Network, for every selected app.
-                                                    if (doNetAll || doNetBackground) {
-                                                        if (doNetAll) {
-                                                            val chain3 =
-                                                                execBulk("cmd connectivity get-chain3-enabled").trim()
-                                                            val chain3Disabled =
-                                                                chain3.equals("false", ignoreCase = true) ||
-                                                                        chain3.equals("disabled", ignoreCase = true) ||
-                                                                        chain3.endsWith(": false", ignoreCase = true) ||
-                                                                        chain3.endsWith(": disabled", ignoreCase = true)
+                                                    val shareUris = mutableListOf<android.net.Uri>()
 
-                                                            if (chain3Disabled) {
-                                                                execBulk("cmd connectivity set-chain3-enabled true")
-                                                            }
+                                                    // Run one app fully (all its selected chips,
+                                                    // in priority order) before moving to the
+                                                    // next app, with a short pause in between.
+                                                    targets.forEachIndexed { index, pkg ->
+                                                        currentCoroutineContext().ensureActive()
+                                                        log("=== $pkg ===")
+
+                                                        // 1. Data
+                                                        if (actions.contains("data")) {
+                                                            execBulk("pm clear --user 0 $pkg")
                                                         }
 
-                                                        targets.forEach { pkg ->
-                                                            if (doNetAll) {
-                                                                execBulk(
-                                                                    "cmd connectivity set-package-networking-enabled false $pkg"
-                                                                )
-                                                            }
-                                                            if (doNetBackground) {
-                                                                val uid = runCatching {
-                                                                    context.packageManager
-                                                                        .getApplicationInfo(pkg, 0)
-                                                                        .uid
-                                                                }.getOrNull()
+                                                        // 2. Network
+                                                        if (doNet) {
+                                                            execBulk(
+                                                                "cmd connectivity set-package-networking-enabled $allowAll $pkg"
+                                                            )
 
-                                                                if (uid != null) {
+                                                            val uid = runCatching {
+                                                                context.packageManager
+                                                                    .getApplicationInfo(pkg, 0)
+                                                                    .uid
+                                                            }.getOrNull()
+
+                                                            if (uid != null) {
+                                                                if (allowBackground) {
+                                                                    execBulk(
+                                                                        "cmd netpolicy remove restrict-background-blacklist $uid"
+                                                                    )
+                                                                } else {
                                                                     execBulk(
                                                                         "cmd netpolicy add restrict-background-blacklist $uid"
                                                                     )
-                                                                } else {
-                                                                    log(
-                                                                        "Could not resolve UID for $pkg, skipped background restrict",
-                                                                        "err"
-                                                                    )
                                                                 }
+                                                            } else {
+                                                                log(
+                                                                    "Could not resolve UID for $pkg, skipped background toggle",
+                                                                    "err"
+                                                                )
                                                             }
                                                         }
-                                                    }
 
-                                                    // 4. Force stop, for every selected app.
-                                                    if (actions.contains("stop")) {
-                                                        targets.forEach { pkg ->
+                                                        // 3. Force stop
+                                                        if (actions.contains("stop")) {
                                                             execBulk("am force-stop $pkg")
                                                         }
-                                                    }
 
-                                                    // 5. Share APK, for every selected app.
-                                                    if (actions.contains("share")) {
-                                                        val uris = mutableListOf<android.net.Uri>()
-
-                                                        targets.forEach { pkg ->
-                                                            currentCoroutineContext().ensureActive()
+                                                        // 4. Share APK (collected, sent once at the end)
+                                                        if (actions.contains("share")) {
                                                             log("Extracting APK: $pkg")
                                                             val out = extractApkFile(context, pkg)
-
                                                             if (out != null) {
-                                                                uris += FileProvider.getUriForFile(
+                                                                shareUris += FileProvider.getUriForFile(
                                                                     context,
                                                                     "com.appman.app.fileprovider",
                                                                     out
@@ -578,33 +660,37 @@ class MainActivity : ComponentActivity() {
                                                             }
                                                         }
 
-                                                        currentCoroutineContext().ensureActive()
-                                                        if (uris.isNotEmpty()) {
-                                                            withContext(Dispatchers.Main) {
-                                                                context.startActivity(
-                                                                    Intent.createChooser(
-                                                                        Intent(Intent.ACTION_SEND_MULTIPLE).apply {
-                                                                            type = "application/vnd.android.package-archive"
-                                                                            putParcelableArrayListExtra(
-                                                                                Intent.EXTRA_STREAM,
-                                                                                ArrayList(uris)
-                                                                            )
-                                                                            addFlags(
-                                                                                Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                                                                                        Intent.FLAG_ACTIVITY_NEW_TASK
-                                                                            )
-                                                                        },
-                                                                        "Share APKs"
-                                                                    )
-                                                                )
-                                                            }
+                                                        // 5. Uninstall (lowest priority, do last per app)
+                                                        if (actions.contains("uninstall")) {
+                                                            execBulk("pm uninstall --user 0 $pkg")
+                                                        }
+
+                                                        // Pause before the next app, unless this
+                                                        // was the last one.
+                                                        if (index != targets.lastIndex) {
+                                                            delay(interAppDelayMs)
                                                         }
                                                     }
 
-                                                    // 6. Uninstall, for every selected app.
-                                                    if (actions.contains("uninstall")) {
-                                                        targets.forEach { pkg ->
-                                                            execBulk("pm uninstall --user 0 $pkg")
+                                                    currentCoroutineContext().ensureActive()
+                                                    if (shareUris.isNotEmpty()) {
+                                                        withContext(Dispatchers.Main) {
+                                                            context.startActivity(
+                                                                Intent.createChooser(
+                                                                    Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                                                                        type = "application/vnd.android.package-archive"
+                                                                        putParcelableArrayListExtra(
+                                                                            Intent.EXTRA_STREAM,
+                                                                            ArrayList(shareUris)
+                                                                        )
+                                                                        addFlags(
+                                                                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                                                                    Intent.FLAG_ACTIVITY_NEW_TASK
+                                                                        )
+                                                                    },
+                                                                    "Share APKs"
+                                                                )
+                                                            )
                                                         }
                                                     }
                                                 } catch (e: CancellationException) {
@@ -617,6 +703,7 @@ class MainActivity : ComponentActivity() {
                                                     netAll = false
                                                     netBackground = false
                                                     netMenuOpen = false
+                                                    netSelected = false
                                                 }
                                             }
                                         }
@@ -688,7 +775,7 @@ private fun findItemIndex(
 }
 @Composable private fun TopBar(terminal: Boolean, setTerminal: (Boolean) -> Unit, connected: Boolean, onPair: () -> Unit, onDisconnect: () -> Unit) {
     Row(Modifier.fillMaxWidth().background(White).padding(horizontal = 18.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) { Text("AppMan", fontSize = 26.sp, fontWeight = FontWeight.ExtraBold, color = Ink); Text(if (connected) "ADB • connected" else "ADB • not connected", fontSize = 12.sp, color = if (connected) Blue else Ink.copy(alpha = .55f)) }
+        Column(Modifier.weight(1f)) { Text("AppMan", fontSize = 26.sp, fontWeight = FontWeight.ExtraBold, fontFamily = NdotFont, color = Ink); Text(if (connected) "ADB • connected" else "ADB • not connected", fontSize = 12.sp, color = if (connected) Blue else Ink.copy(alpha = .55f)) }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AssistChip(onClick = { setTerminal(!terminal) }, label = { Text(if (terminal) "UI mode" else "Terminal") }, leadingIcon = { Icon(if (terminal) Icons.Default.Apps else Icons.Default.Terminal, null) })
             if (!connected) Button(onClick = onPair, colors = ButtonDefaults.buttonColors(containerColor = Blue)) { Text("Pair") } else OutlinedButton(onClick = onDisconnect) { Text("Disconnect") }
@@ -711,13 +798,21 @@ private fun findItemIndex(
     Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         OutlinedTextField(query, onQuery, Modifier.weight(1f), singleLine = true, placeholder = { Text("Search apps…") }, leadingIcon = { Icon(Icons.Default.Search, null) }, shape = RoundedCornerShape(16.dp))
         if (selecting) { IconButton(onClick = onSelectAll) { Icon(Icons.Default.SelectAll, "Select all") }; IconButton(onClick = onClear) { Icon(Icons.Default.Close, "Clear selection") } }
-        Box { IconButton(onClick = { menu = true }) { Icon(Icons.Default.Tune, "Filters") }; DropdownMenu(menu, { menu = false }) {
-            Text("Apps", Modifier.padding(12.dp), fontWeight = FontWeight.Bold)
-            AppFilter.values().forEach { DropdownMenuItem(text = { Text(it.name.lowercase().replaceFirstChar { c -> c.uppercase() }) }, onClick = { onFilter(it); menu = false }) }
-            Divider(); Text("Sort", Modifier.padding(12.dp), fontWeight = FontWeight.Bold)
-            DropdownMenuItem(text = { Text("A–Z name") }, onClick = { onSort(SortBy.NAME); menu = false })
-            DropdownMenuItem(text = { Text("Size") }, onClick = { onSort(SortBy.SIZE); menu = false })
-            DropdownMenuItem(text = { Text(if (asc) "Ascending" else "Descending") }, onClick = { toggleAsc(); menu = false })
+        Box { IconButton(onClick = { menu = true }) { Icon(Icons.Default.Tune, "Filters") }; DropdownMenu(
+            menu, { menu = false },
+            shape = RoundedCornerShape(14.dp),
+            containerColor = Black,
+            tonalElevation = 0.dp,
+            shadowElevation = 6.dp
+        ) {
+            CompositionLocalProvider(LocalContentColor provides White) {
+                Text("Apps", Modifier.padding(12.dp), fontWeight = FontWeight.Bold, fontFamily = NdotFont, color = White)
+                AppFilter.values().forEach { DropdownMenuItem(text = { Text(it.name.lowercase().replaceFirstChar { c -> c.uppercase() }, color = White) }, onClick = { onFilter(it); menu = false }) }
+                Divider(color = White.copy(alpha = .2f)); Text("Sort", Modifier.padding(12.dp), fontWeight = FontWeight.Bold, fontFamily = NdotFont, color = White)
+                DropdownMenuItem(text = { Text("A–Z name", color = White) }, onClick = { onSort(SortBy.NAME); menu = false })
+                DropdownMenuItem(text = { Text("Size", color = White) }, onClick = { onSort(SortBy.SIZE); menu = false })
+                DropdownMenuItem(text = { Text(if (asc) "Ascending" else "Descending", color = White) }, onClick = { toggleAsc(); menu = false })
+            }
         } }
     }
 }
@@ -949,7 +1044,9 @@ private fun AppDetail(
                         execTransparent(
                             "cmd connectivity set-package-networking-enabled false ${item.packageName}"
                         )
-
+                        execTransparent(
+                            "cmd netpolicy add restrict-background-blacklist $uid"
+                        )
                         withContext(Dispatchers.Main) {
                             backgroundEnabled = false
                         }
@@ -1136,20 +1233,20 @@ private fun AppDetail(
                     ) {
                         DataInfoRow("App size", formatSize(item.sizeBytes))
 
-                        ActionButton(
-                            "Clear cache",
-                            Icons.Default.CleaningServices
-                        ) {
-                            onLog("Clear cache requested: ${item.packageName}")
-                            onRun("pm clear --cache-only ${item.packageName}")
-                        }
+//                        ActionButton(
+//                            "Clear cache",
+//                            Icons.Default.CleaningServices
+//                        ) {
+//                            onLog("Clear cache requested: ${item.packageName}")
+//                            onRun("pm clear --cache-only --user 0 ${item.packageName}")
+//                        }
 
                         ActionButton(
                             "Clear data",
                             Icons.Default.DeleteSweep
                         ) {
                             onLog("Clear data requested: ${item.packageName}")
-                            onRun("pm clear ${item.packageName}")
+                            onRun("pm clear --user 0 ${item.packageName}")
                         }
 
                         ActionButton(
@@ -1380,13 +1477,14 @@ private fun ActionButton(
     toggleNetBackground: () -> Unit,
     netMenuOpen: Boolean,
     onNetClick: () -> Unit,
+    onNetExpandClick: () -> Unit,   // added new
     onNetDismiss: () -> Unit,
     running: Boolean,
     onGo: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Surface(
-        modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), shadowElevation = 10.dp, color = Ink) {
+        modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), shadowElevation = 10.dp, color = Black) {
         Column(Modifier.padding(10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("$count selected", color = White, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
@@ -1423,11 +1521,11 @@ private fun ActionButton(
                         onClick = onGo,
                         colors = ButtonDefaults.buttonColors(
                             containerColor = Yellow,
-                            contentColor = Ink
+                            contentColor = Black
                         ),
                         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 10.dp)
                     ) {
-                        Text("GO", color = Ink, fontWeight = FontWeight.Bold)
+                        Text("GO", color = Black, fontWeight = FontWeight.Bold)
                     }
                 }
             }
@@ -1439,6 +1537,15 @@ private fun ActionButton(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                // commented out the cache part cuz pm clear --cache-only gets stuck
+//                FilterChip(
+//                    modifier = Modifier.height(48.dp),
+//                    selected = actions.contains("cache"),
+//                    onClick = { toggleAction("cache") },
+//                    leadingIcon = { Icon(Icons.Default.Cookie, null, Modifier.size(16.dp)) },
+//                    label = { Text("Cache", fontSize = 11.sp) }
+//                )
+
                 FilterChip(
                     modifier = Modifier.height(48.dp),
                     selected = actions.contains("data"),
@@ -1446,27 +1553,69 @@ private fun ActionButton(
                     leadingIcon = { Icon(Icons.Default.Storage, null, Modifier.size(16.dp)) },
                     label = { Text("Data", fontSize = 11.sp) }
                 )
+
+//                Box {
+//                    FilterChip(
+//                        modifier = Modifier.height(48.dp),
+//                        selected = netSelected,
+//                        onClick = onNetClick,
+//                        leadingIcon = { Icon(Icons.Default.CellTower, null, Modifier.size(16.dp)) },
+//                        trailingIcon = { Icon(Icons.Default.ExpandMore, null, Modifier.size(16.dp)) },
+//                        label = { Text("Net", fontSize = 11.sp) }
+//                    )
+//                    DropdownMenu(netMenuOpen, onNetDismiss) {
+//                        DropdownMenuItem(
+//                            text = { Text("Background") },
+//                            leadingIcon = {
+//                                Checkbox(checked = netBackground, onCheckedChange = { toggleNetBackground() })
+//                            },
+//                            onClick = toggleNetBackground
+//                        )
+//                        DropdownMenuItem(
+//                            text = { Text("All") },
+//                            leadingIcon = {
+//                                Checkbox(checked = netAll, onCheckedChange = { toggleNetAll() })
+//                            },
+//                            onClick = toggleNetAll
+//                        )
+//                    }
+//                }
                 Box {
                     FilterChip(
                         modifier = Modifier.height(48.dp),
-                        selected = netSelected,
-                        onClick = onNetClick,
+                        selected = netSelected, // independent state, default false
+                        onClick = onNetClick,   // toggles netSelected only
                         leadingIcon = { Icon(Icons.Default.CellTower, null, Modifier.size(16.dp)) },
-                        trailingIcon = { Icon(Icons.Default.ExpandMore, null, Modifier.size(16.dp)) },
+                        trailingIcon = {
+                            Icon(
+                                Icons.Default.ExpandMore,
+                                contentDescription = null,
+                                modifier = Modifier
+                                    .size(16.dp)
+                                    .clickable { onNetExpandClick() } // opens the dropdown only
+                            )
+                        },
                         label = { Text("Net", fontSize = 11.sp) }
                     )
+
                     DropdownMenu(netMenuOpen, onNetDismiss) {
                         DropdownMenuItem(
                             text = { Text("Background") },
-                            leadingIcon = {
-                                Checkbox(checked = netBackground, onCheckedChange = { toggleNetBackground() })
+                            trailingIcon = {
+                                Switch(
+                                    checked = netBackground,
+                                    onCheckedChange = { toggleNetBackground() }
+                                )
                             },
                             onClick = toggleNetBackground
                         )
                         DropdownMenuItem(
                             text = { Text("All") },
-                            leadingIcon = {
-                                Checkbox(checked = netAll, onCheckedChange = { toggleNetAll() })
+                            trailingIcon = {
+                                Switch(
+                                    checked = netAll,
+                                    onCheckedChange = { toggleNetAll() }
+                                )
                             },
                             onClick = toggleNetAll
                         )
@@ -1495,6 +1644,52 @@ private fun ActionButton(
                 )
             }
         }
+    }
+}
+
+// Four squares in a 2x2 grid that blink one at a time, clockwise
+// (top-left -> top-right -> bottom-right -> bottom-left -> repeat), as
+// a lightweight loading indicator for the app list.
+@Composable private fun PixelLoader(
+    modifier: Modifier = Modifier,
+    squareSize: androidx.compose.ui.unit.Dp = 16.dp,
+    gap: androidx.compose.ui.unit.Dp = 5.dp
+) {
+    val colors = remember {
+        listOf(
+            Color(0xFF601D49), // top-left
+            Color(0xFFBD5579), // top-right
+            Color(0xFFEA9D9D), // bottom-right
+            Color(0xFFFFEBB8)  // bottom-left
+        )
+    }
+
+    var active by remember { mutableStateOf(0) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(220)
+            active = (active + 1) % 4
+        }
+    }
+
+    val alphas = (0..3).map { i ->
+        animateFloatAsState(
+            targetValue = if (i == active) 1f else 0.28f,
+            animationSpec = tween(180),
+            label = "pixel$i"
+        ).value
+    }
+
+    @Composable
+    fun pixel(index: Int) = Box(
+        Modifier
+            .size(squareSize)
+            .background(colors[index].copy(alpha = alphas[index]), RoundedCornerShape(3.dp))
+    )
+
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(gap)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(gap)) { pixel(0); pixel(1) }
+        Row(horizontalArrangement = Arrangement.spacedBy(gap)) { pixel(3); pixel(2) }
     }
 }
 
@@ -1528,11 +1723,11 @@ private fun ActionButton(
 
 @Composable private fun HoodPanel(lines: List<HoodLine>, expanded: Boolean, onExpand: () -> Unit, onClear: () -> Unit, onMax: () -> Unit, modifier: Modifier = Modifier) {
     Surface(modifier.fillMaxWidth(), color = Black) {
-        Column(Modifier.fillMaxSize()) { Row(Modifier.padding(horizontal = 12.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) { Text("HOOD", color = White, fontWeight = FontWeight.ExtraBold, modifier = Modifier.weight(1f)); IconButton(onClick = onClear) { Icon(Icons.Default.RemoveCircleOutline, "Clear HOOD", tint = White) }; IconButton(onClick = onExpand) { Icon(if (expanded) Icons.Default.ExpandMore else Icons.Default.ExpandLess, null, tint = White) }; IconButton(onClick = onMax) { Icon(Icons.Default.OpenInFull, null, tint = White) } }; LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp), reverseLayout = false) { items(lines) { Text(it.text, color = if (it.kind == "err") Color(0xFFFF7B72) else White.copy(.88f), fontSize = 11.sp, modifier = Modifier.padding(bottom = 3.dp)) } } }
+        Column(Modifier.fillMaxSize()) { Row(Modifier.padding(horizontal = 12.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) { Text("HOOD", color = White, fontWeight = FontWeight.ExtraBold, fontFamily = NdotFont, modifier = Modifier.weight(1f)); IconButton(onClick = onClear) { Icon(Icons.Default.RemoveCircleOutline, "Clear HOOD", tint = White) }; IconButton(onClick = onExpand) { Icon(if (expanded) Icons.Default.ExpandMore else Icons.Default.ExpandLess, null, tint = White) }; IconButton(onClick = onMax) { Icon(Icons.Default.OpenInFull, null, tint = White) } }; LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp), reverseLayout = false) { items(lines) { Text(it.text, color = if (it.kind == "err") Color(0xFFFF7B72) else White.copy(.88f), fontSize = 11.sp, modifier = Modifier.padding(bottom = 3.dp)) } } }
     }
 }
 
-@Composable private fun FullHood(lines: List<HoodLine>, onClear: () -> Unit, onClose: () -> Unit) { Surface(Modifier.fillMaxSize(), color = Black) { Column(Modifier.padding(16.dp)) { Row(verticalAlignment = Alignment.CenterVertically) { Text("HOOD", color = White, fontWeight = FontWeight.ExtraBold, modifier = Modifier.weight(1f)); IconButton(onClick = onClear) { Icon(Icons.Default.RemoveCircleOutline, "Clear HOOD", tint = White) }; IconButton(onClick = onClose) { Icon(Icons.Default.CloseFullscreen, null, tint = White) } }; LazyColumn(Modifier.fillMaxSize()) { items(lines) { Text(it.text, color = White.copy(.9f), fontSize = 12.sp, modifier = Modifier.padding(vertical = 3.dp)) } } } } }
+@Composable private fun FullHood(lines: List<HoodLine>, onClear: () -> Unit, onClose: () -> Unit) { Surface(Modifier.fillMaxSize(), color = Black) { Column(Modifier.padding(16.dp)) { Row(verticalAlignment = Alignment.CenterVertically) { Text("HOOD", color = White, fontWeight = FontWeight.ExtraBold, fontFamily = NdotFont, modifier = Modifier.weight(1f)); IconButton(onClick = onClear) { Icon(Icons.Default.RemoveCircleOutline, "Clear HOOD", tint = White) }; IconButton(onClick = onClose) { Icon(Icons.Default.CloseFullscreen, null, tint = White) } }; LazyColumn(Modifier.fillMaxSize()) { items(lines) { Text(it.text, color = White.copy(.9f), fontSize = 12.sp, modifier = Modifier.padding(vertical = 3.dp)) } } } } }
 
 @Composable private fun PairDialog(code: String, onCode: (String) -> Unit, onDismiss: () -> Unit, onPair: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Pair wireless debugging") }, text = { Column(verticalArrangement = Arrangement.spacedBy(10.dp)) { Text("Open Developer options → Wireless debugging → Pair device with pairing code. Enter the current six-digit code below. The persistent AppMan notification also accepts the code.", fontSize = 13.sp); OutlinedTextField(code, { onCode(it.filter(Char::isDigit).take(6)) }, label = { Text("Pairing code") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)) } }, confirmButton = { Button(onClick = onPair) { Text("Pair") } }, dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } })

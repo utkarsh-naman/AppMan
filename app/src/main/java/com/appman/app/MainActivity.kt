@@ -586,7 +586,9 @@ class MainActivity : ComponentActivity() {
                                                         val chain3 =
                                                             execBulk("cmd connectivity get-chain3-enabled").trim()
                                                         val chain3Disabled =
-                                                            chain3.equals("false", ignoreCase = true) ||
+                                                            chain3.equals("chain:false", ignoreCase = true) ||
+                                                                    chain3.equals("chain:disabled", ignoreCase = true) ||
+                                                                    chain3.equals("false", ignoreCase = true) ||
                                                                     chain3.equals("disabled", ignoreCase = true) ||
                                                                     chain3.endsWith(": false", ignoreCase = true) ||
                                                                     chain3.endsWith(": disabled", ignoreCase = true)
@@ -1023,23 +1025,44 @@ private fun AppDetail(
                         return output
                     }
 
+                    // First check chain3. Only enable it when it is disabled.
+                    val chain3Command =
+                        "cmd connectivity get-chain3-enabled"
+                    val chain3 = execTransparent(chain3Command).trim()
+
+                    val chain3Disabled =
+                        chain3.equals("chain:false", ignoreCase = true) ||
+                                chain3.equals("chain:disabled", ignoreCase = true) ||
+                                chain3.equals("false", ignoreCase = true) ||
+                                chain3.equals("disabled", ignoreCase = true) ||
+                                chain3.endsWith(": false", ignoreCase = true) ||
+                                chain3.endsWith(": disabled", ignoreCase = true)
+
+                    if (chain3Disabled) {
+                        execTransparent(
+                            "cmd connectivity set-chain3-enabled true"
+                        )
+                    }
+
                     if (!enabled) {
                         // First check chain3. Only enable it when it is disabled.
-                        val chain3Command =
-                            "cmd connectivity get-chain3-enabled"
-                        val chain3 = execTransparent(chain3Command).trim()
-
-                        val chain3Disabled =
-                            chain3.equals("false", ignoreCase = true) ||
-                                    chain3.equals("disabled", ignoreCase = true) ||
-                                    chain3.endsWith(": false", ignoreCase = true) ||
-                                    chain3.endsWith(": disabled", ignoreCase = true)
-
-                        if (chain3Disabled) {
-                            execTransparent(
-                                "cmd connectivity set-chain3-enabled true"
-                            )
-                        }
+//                        val chain3Command =
+//                            "cmd connectivity get-chain3-enabled"
+//                        val chain3 = execTransparent(chain3Command).trim()
+//
+//                        val chain3Disabled =
+//                            chain3.equals("chain:false", ignoreCase = true) ||
+//                                    chain3.equals("chain:disabled", ignoreCase = true) ||
+//                                    chain3.equals("false", ignoreCase = true) ||
+//                                    chain3.equals("disabled", ignoreCase = true) ||
+//                                    chain3.endsWith(": false", ignoreCase = true) ||
+//                                    chain3.endsWith(": disabled", ignoreCase = true)
+//
+//                        if (chain3Disabled) {
+//                            execTransparent(
+//                                "cmd connectivity set-chain3-enabled true"
+//                            )
+//                        }
 
                         execTransparent(
                             "cmd connectivity set-package-networking-enabled false ${item.packageName}"
@@ -1082,10 +1105,30 @@ private fun AppDetail(
                 runCatching {
                     val adb = AdbManager.get(context)
 
-                    fun execTransparent(command: String) {
+                    fun execTransparent(command: String): String {
                         onLog("$ $command")
                         val output = adb.exec(command)
                         onLog(output.ifBlank { "(no output)" })
+                        return output
+                    }
+
+                    // First check chain3. Only enable it when it is disabled.
+                    val chain3Command =
+                        "cmd connectivity get-chain3-enabled"
+                    val chain3 = execTransparent(chain3Command).trim()
+
+                    val chain3Disabled =
+                        chain3.equals("chain:false", ignoreCase = true) ||
+                                chain3.equals("chain:disabled", ignoreCase = true) ||
+                                chain3.equals("false", ignoreCase = true) ||
+                                chain3.equals("disabled", ignoreCase = true) ||
+                                chain3.endsWith(": false", ignoreCase = true) ||
+                                chain3.endsWith(": disabled", ignoreCase = true)
+
+                    if (chain3Disabled) {
+                        execTransparent(
+                            "cmd connectivity set-chain3-enabled true"
+                        )
                     }
 
                     if (!enabled) {

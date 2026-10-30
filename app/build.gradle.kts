@@ -12,8 +12,11 @@ android {
         applicationId = "com.appman.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.4"
+        versionCode = 2
+        versionName = "0.1.5"
+        // armeabi-v7a-only: 32-bit build for older devices. Drops the
+        // arm64/x86/x86_64 conscrypt libs. arm64 build lives on its own branch.
+        ndk { abiFilters += "armeabi-v7a" }
     }
 
     buildFeatures {
@@ -30,6 +33,9 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
             excludes += "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+            // BouncyCastle jar resources (Picnic PQC tables + PKIX reviewer
+            // messages) are not used: no BC provider, no PKIX validation.
+            excludes += "org/bouncycastle/**"
         }
     }
 

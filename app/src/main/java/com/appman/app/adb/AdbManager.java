@@ -9,7 +9,6 @@ import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.cert.X509CertificateHolder;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
-import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 
@@ -25,7 +24,6 @@ import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.PrivateKey;
-import java.security.Security;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
 import java.security.spec.PKCS8EncodedKeySpec;
@@ -285,9 +283,9 @@ public final class AdbManager {
         PersistentAdbConnectionManager(Context c) throws Exception {
             context = c;
             setApi(Build.VERSION.SDK_INT);
-//          if (Security.getProvider("BC") == null) Security.addProvider(new BouncyCastleProvider());
-            Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME);
-            Security.insertProviderAt(new BouncyCastleProvider(), 1);
+            // BC's ASN.1 builder/signer classes are used directly; its JCE
+            // provider is not. Keeping the provider in the APK cost ~1.9 MB of
+            // dex, which Android also carries in vdex/odex after compilation.
             KeyPair pair = loadKeyPair(); privateKey = pair.getPrivate(); certificate = loadOrCreateCertificate(pair);
         }
         @Override protected PrivateKey getPrivateKey() { return privateKey; }
@@ -310,9 +308,9 @@ public final class AdbManager {
             long now = System.currentTimeMillis();
             X500Name name = new X500Name("CN=AppMan ADB");
             JcaX509v3CertificateBuilder b = new JcaX509v3CertificateBuilder(name, BigInteger.valueOf(now), new Date(now - 86400000L), new Date(now + 3650L * 86400000L), name, kp.getPublic());
-            ContentSigner signer = new JcaContentSignerBuilder("SHA256withRSA").setProvider("BC").build(kp.getPrivate());
+            ContentSigner signer = new JcaContentSignerBuilder("SHA256withRSA").build(kp.getPrivate());
             X509CertificateHolder holder = b.build(signer);
-            Certificate cert = new JcaX509CertificateConverter().setProvider("BC").getCertificate(holder); write(f, cert.getEncoded()); return cert;
+            Certificate cert = new JcaX509CertificateConverter().getCertificate(holder); write(f, cert.getEncoded()); return cert;
         }
         private static byte[] readAll(File f) throws IOException { try (InputStream in = new FileInputStream(f)) { java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream(); byte[] b = new byte[4096]; int n; while ((n=in.read(b))!=-1) o.write(b,0,n); return o.toByteArray(); } }
         private static void write(File f, byte[] b) throws IOException { try (OutputStream out = new FileOutputStream(f)) { out.write(b); } }

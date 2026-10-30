@@ -1,8 +1,7 @@
-# BouncyCastle resolves algorithm implementations by name at runtime. Needed
-# to build the self-signed certificate used for ADB pairing TLS.
--keep class org.bouncycastle.jce.provider.BouncyCastleProvider { *; }
--keep class org.bouncycastle.jcajce.provider.** { *; }
--keep class org.bouncycastle.jce.provider.** { *; }
+# libadb uses BouncyCastle's lightweight crypto API directly (HKDF, AES-GCM,
+# SHA-256) and AppMan uses its ASN.1 cert builder to sign the ADB TLS
+# certificate. Neither path goes through the BC JCE provider, so R8 is allowed
+# to strip it (~1.9 MB of dex, which Android also stores again as vdex/odex).
 -dontwarn org.bouncycastle.**
 
 # libadb loads org.conscrypt.OpenSSLProvider and calls

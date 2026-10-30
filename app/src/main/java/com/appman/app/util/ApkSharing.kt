@@ -24,6 +24,10 @@ internal suspend fun extractApkFile(context: Context, packageName: String): File
             val b64 = adb.exec("base64 $remotePath").replace(Regex("\\s"), "")
             val bytes = Base64.decode(b64, Base64.DEFAULT)
             val dir = File(context.cacheDir, "shared_apks").apply { mkdirs() }
+            // Nothing ever deleted these copies, so every shared APK stayed in
+            // cache forever. Drop day-old ones; the current batch is seconds old.
+            val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
+            dir.listFiles()?.forEach { if (it.lastModified() < cutoff) it.delete() }
             val out = File(dir, packageName.replace('.', '_') + ".apk")
             out.writeBytes(bytes)
             out
